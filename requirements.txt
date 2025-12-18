@@ -2,4 +2,4 @@ streamlit==1.39.0
 pandas==2.3.3
 openpyxl==3.1.5
 rapidfuzz==3.14.1
-phonenumbers==8.13.55
+phonenumbers==8.13.54
