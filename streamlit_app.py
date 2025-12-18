@@ -139,14 +139,33 @@ def _domain_base(domain: str) -> str:
     base = re.sub(r"[^a-z0-9]", "", base.lower())
     return base
 
+COUNTRY_WORDS_FOR_ACRONYM = {
+    "uk", "u.k", "gb", "great", "britain", "england", "scotland", "wales", "ireland",
+    "usa", "us", "u.s", "united", "states", "america",
+    "uae", "u.a.e", "dubai", "abu", "dhabi",
+}
+
+STOPWORDS = {"of", "and", "the", "for", "to", "a"}
+
 def _company_tokens(company: str) -> list[str]:
     if not isinstance(company, str):
         return []
     s = company.strip()
-    s = re.sub(r"^\s*uk\s*[-–—:]\s*", "", s, flags=re.IGNORECASE)  # strip leading "UK -"
+
+    # Remove leading "UK - " etc.
+    s = re.sub(r"^\s*uk\s*[-–—:]\s*", "", s, flags=re.IGNORECASE)
+
+    # Normalize punctuation -> spaces
     s = re.sub(r"[^A-Za-z0-9\s]", " ", s)
     toks = [t.lower() for t in s.split() if t.strip()]
-    toks = [t for t in toks if t not in SUFFIXES and t not in {"of","and","the","for","to","a"}]
+
+    # Remove legal suffixes BUT keep 'group' for acronym purposes (IHG case)
+    toks = [t for t in toks if (t not in SUFFIXES) or (t == "group")]
+
+    # Remove stopwords + country words (so "Electronic Arts UK" becomes EA, not EAU)
+    toks = [t for t in toks if t not in STOPWORDS]
+    toks = [t for t in toks if t not in COUNTRY_WORDS_FOR_ACRONYM]
+
     return toks
 
 def _company_acronym(company: str) -> str:
@@ -174,7 +193,7 @@ def compare_company_domain(company, domain) -> tuple[str, int, str]:
     if not dbase:
         return "Unsure – Please Check", 0, "missing/invalid domain"
 
-    # 1) Electronic Arts -> EA -> ea.com etc.
+    # 1) Acronym match (EA, IHG etc.)
     acr = _company_acronym(c_raw)
     if acr and dbase == acr.lower():
         return "Likely Match", 99, "company acronym equals domain"
@@ -183,7 +202,7 @@ def compare_company_domain(company, domain) -> tuple[str, int, str]:
     c_compact = re.sub(r"[^A-Za-z0-9]", "", c_raw).upper()
     if 2 <= len(c_compact) <= 6 and c_compact.isalpha():
         if _is_subsequence(c_compact.lower(), dbase):
-            return "Likely Match", 92, "company abbreviation is subsequence of domain"
+            return "Likely Match", 92, "company abbreviation in domain"
 
     # 3) Token containment
     toks = _company_tokens(c_raw)
@@ -202,7 +221,6 @@ def compare_company_domain(company, domain) -> tuple[str, int, str]:
     if score >= 70:
         return "Unsure – Please Check", score, "weak fuzzy"
     return "Likely NOT Match", score, "low similarity"
-
 
 # ------------------ Seniority parsing (NO Seniority_Logic column) ------------------
 def parse_seniority(title):
