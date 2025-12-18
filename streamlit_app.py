@@ -8,6 +8,13 @@ from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
 import streamlit as st
 
+# Optional dependency for phone validation (added in requirements.txt).
+try:
+    import phonenumbers
+except Exception:  # pragma: no cover
+    phonenumbers = None
+
+
 # ------------------ constants ------------------
 
 SUFFIXES = {
@@ -32,6 +39,108 @@ COUNTRY_EQUIVALENTS = {
 }
 
 THRESHOLD = 70
+
+# Minimal country → ISO region mapping for phone validation.
+# (We normalize using COUNTRY_EQUIVALENTS first, then map to a 2-letter region when possible.)
+COUNTRY_TO_REGION2 = {
+    "ireland": "IE",
+    "united kingdom": "GB",
+    "great britain": "GB",
+    "united states": "US",
+    "canada": "CA",
+    "australia": "AU",
+    "new zealand": "NZ",
+    "singapore": "SG",
+    "malaysia": "MY",
+    "thailand": "TH",
+    "indonesia": "ID",
+    "philippines": "PH",
+    "hong kong": "HK",
+    "taiwan": "TW",
+    "japan": "JP",
+    "korea": "KR",
+    "republic of korea": "KR",
+    "china": "CN",
+    "india": "IN",
+    "vietnam": "VN",
+    "france": "FR",
+    "germany": "DE",
+    "spain": "ES",
+    "italy": "IT",
+    "netherlands": "NL",
+    "belgium": "BE",
+    "sweden": "SE",
+    "norway": "NO",
+    "denmark": "DK",
+    "finland": "FI",
+    "switzerland": "CH",
+    "austria": "AT",
+    "portugal": "PT",
+    "poland": "PL",
+    "czech republic": "CZ",
+    "united arab emirates": "AE",
+    "saudi arabia": "SA",
+}
+
+def _normalize_country_name(country: str) -> str:
+    if not isinstance(country, str):
+        return ""
+    c = country.strip().lower()
+    return COUNTRY_EQUIVALENTS.get(c, c)
+
+def _validate_phone_vs_country(phone: str, country: str):
+    """Return (status, reason, e164) where status in {Match, Mismatch, Unsure}."""
+    if not isinstance(phone, str) or not phone.strip():
+        return "Unsure", "missing phone", ""
+    c_norm = _normalize_country_name(country)
+    region = COUNTRY_TO_REGION2.get(c_norm, "")
+    raw = phone.strip()
+
+    # If phonenumbers isn't installed, do a light-touch heuristic only.
+    if phonenumbers is None:
+        if raw.startswith("+") and region:
+            return "Unsure", "phonenumbers not installed (cannot validate)", raw
+        return "Unsure", "phonenumbers not installed (cannot validate)", raw
+
+    try:
+        # Parse with region if not explicitly international.
+        parsed = phonenumbers.parse(raw, region or None)
+        if not phonenumbers.is_possible_number(parsed):
+            return "Mismatch", "number not possible", ""
+        if not phonenumbers.is_valid_number(parsed):
+            return "Mismatch", "number not valid", ""
+        e164 = phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164)
+
+        # If we don't know the expected region, we can still output the parsed region.
+        parsed_region = (phonenumbers.region_code_for_number(parsed) or "").upper()
+
+        if not region:
+            return "Unsure", f"unknown country mapping for '{country}' (parsed region {parsed_region})", e164
+
+        if parsed_region == region:
+            return "Match", f"matches country {region}", e164
+
+        return "Mismatch", f"country {region} but phone parses to {parsed_region}", e164
+    except Exception as e:
+        return "Unsure", f"parse error: {e}", ""
+
+def _best_picklist_match(value: str, pick_values, min_score: int = 90):
+    """Return (matched_value, score) for the best fuzzy match to pick_values."""
+    if not isinstance(value, str) or not value.strip():
+        return "", 0
+    v_norm = _normalize_tokens(value)
+    best_val, best_score = "", 0
+    for p in pick_values:
+        p_str = str(p).strip()
+        if not p_str:
+            continue
+        p_norm = _normalize_tokens(p_str)
+        s = fuzz.token_sort_ratio(v_norm, p_norm)
+        if s > best_score:
+            best_score = s
+            best_val = p_str
+    return (best_val, best_score) if best_score >= min_score else ("", best_score)
+
 
 # ------------------ helpers ------------------
 
@@ -177,6 +286,73 @@ def run_matching(master_bytes: bytes, picklist_bytes: bytes, highlight_changes=T
 
     # company ↔ domain validation
     if progress_cb: progress_cb(0.6, text="Validating company ↔ domain...")
+
+
+    # --- Company Name mapping (fuzzy) ---
+    if "companyname" in df_master.columns and "companyname" in df_picklist.columns:
+        pick_companies = df_picklist["companyname"].dropna().astype(str).tolist()
+        comp_status, comp_match, comp_score = [], [], []
+        for i, val in enumerate(df_master["companyname"].fillna("").astype(str)):
+            if not val.strip():
+                comp_status.append("Missing"); comp_match.append(""); comp_score.append(0)
+                continue
+
+            # First try normalized exact match (handles "Group" / suffixes).
+            v_norm = _normalize_tokens(val)
+            found = ""
+            for p in pick_companies:
+                if _normalize_tokens(p) == v_norm:
+                    found = str(p).strip()
+                    break
+
+            if found:
+                comp_status.append("Yes"); comp_match.append(found); comp_score.append(100)
+                if found != val:
+                    df_out.at[i, "companyname"] = found
+                    corrected_cells.add(("companyname", i + 2))
+            else:
+                best, score = _best_picklist_match(val, pick_companies, min_score=90)
+                if best:
+                    comp_status.append("Yes"); comp_match.append(best); comp_score.append(score)
+                    if best != val:
+                        df_out.at[i, "companyname"] = best
+                        corrected_cells.add(("companyname", i + 2))
+                else:
+                    comp_status.append("No"); comp_match.append(""); comp_score.append(score)
+
+        df_out["CompanyName_Match_Status"] = comp_status
+        df_out["CompanyName_Matched_Value"] = comp_match
+        df_out["CompanyName_Match_Score"] = comp_score
+    else:
+        df_out["CompanyName_Match_Status"] = "Column Missing"
+
+    # --- Phone vs Country validation ---
+    phone_cols = [c for c in df_master.columns if c.strip().lower() in ["telephone","phone","phone_number","phone number","mobile","mobilephone"]]
+    country_cols = [c for c in df_master.columns if c.strip().lower() in ["lead_country","country","c_country"]]
+    if phone_cols and country_cols:
+        phone_col = phone_cols[0]
+        country_col = country_cols[0]
+        p_status, p_reason, p_e164 = [], [], []
+        for i in range(len(df_master)):
+            phone = str(df_master.at[i, phone_col]) if pd.notna(df_master.at[i, phone_col]) else ""
+            country = str(df_master.at[i, country_col]) if pd.notna(df_master.at[i, country_col]) else ""
+            status, reason, e164 = _validate_phone_vs_country(phone, country)
+            p_status.append(status); p_reason.append(reason); p_e164.append(e164)
+        df_out["Phone_Country_Status"] = p_status
+        df_out["Phone_Country_Reason"] = p_reason
+        df_out["Phone_E164"] = p_e164
+    else:
+        df_out["Phone_Country_Status"] = "No phone/country columns found"
+
+    # --- Required field completeness check (easy to extend) ---
+    default_required = ["email","companyname","firstname","lastname","jobtitle","lead_country"]
+    present_required = [c for c in default_required if c in df_master.columns]
+    if present_required:
+        missing_list = []
+        for i in range(len(df_master)):
+            missing = [c for c in present_required if not str(df_master.at[i, c]).strip() or pd.isna(df_master.at[i, c])]
+            missing_list.append(", ".join(missing))
+        df_out["Missing_Required_Fields"] = missing_list
 
     company_cols = [c for c in df_master.columns if c.strip().lower() in ["companyname","company","company name","company_name"]]
     domain_cols  = [c for c in df_master.columns if c.strip().lower() in ["website","domain","email domain","email_domain"]]
