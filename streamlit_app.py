@@ -1,73 +1,78 @@
 import io
-import os
 import re
 import unicodedata
+
 import pandas as pd
 import streamlit as st
 from rapidfuzz import fuzz
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
 
-# Optional: phone validation
 import phonenumbers
 from phonenumbers.phonenumberutil import country_code_for_region
 
-# ------------------ page config (UI) ------------------
+
+# ------------------ UI / Page config ------------------
 st.set_page_config(page_title="Lead Quality Checker", page_icon="✅", layout="wide")
 
-# ------------------ constants ------------------
+HIGHLIGHT_FILL = PatternFill(start_color="FFF59D", end_color="FFF59D", fill_type="solid")  # soft yellow
 
-# Common legal suffixes / noise words to ignore in company matching
-SUFFIXES = {
-    "ltd","limited","co","company","corp","corporation","inc","incorporated",
-    "plc","public","llc","lp","llp","ulc","pc","pllc","sa","ag","nv","se","bv",
-    "oy","ab","aps","as","kft","zrt","rt","sarl","sas","spa","gmbh","ug","bvba",
-    "kg","kgaa","pte","pty","sdn","bhd","kk","k.k.","co.","ltd.","inc.","plc.",
-    "holdings","holding","group"  # we will still treat "group" specially in fuzzy step
-}
 
-THRESHOLD_WEAK = 70
-THRESHOLD_STRONG = 85
+# ------------------ Normalisation helpers ------------------
+def norm_text(s) -> str:
+    """Robust normalizer: trims, casefolds, collapses whitespace, removes NBSP, fixes unicode."""
+    if s is None or (isinstance(s, float) and pd.isna(s)):
+        return ""
+    s = str(s)
+    s = unicodedata.normalize("NFKC", s)
+    s = s.replace("\u00A0", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s.casefold()
 
-# Alias map: raw data variants -> canonical key (lowercase)
-# NOTE: Keep conservative. Anything politically sensitive should be explicitly approved.
+
+# ------------------ Country standardisation ------------------
 COUNTRY_ALIASES_TO_CANON = {
-    # United Kingdom nations/variants -> united kingdom
-    "uk":"united kingdom",
-    "u.k.":"united kingdom",
-    "great britain":"united kingdom",
-    "britain":"united kingdom",
-    "gb":"united kingdom",
-    "england":"united kingdom",
-    "scotland":"united kingdom",
-    "wales":"united kingdom",
-    "northern ireland":"united kingdom",
+    # UK nations/variants → united kingdom
+    "uk": "united kingdom",
+    "u.k.": "united kingdom",
+    "gb": "united kingdom",
+    "great britain": "united kingdom",
+    "britain": "united kingdom",
+    "england": "united kingdom",
+    "scotland": "united kingdom",
+    "wales": "united kingdom",
+    "northern ireland": "united kingdom",
 
-    # United States variants -> united states
-    "us":"united states",
-    "u.s.":"united states",
-    "usa":"united states",
-    "u.s.a.":"united states",
-    "america":"united states",
-    "united states of america":"united states",
+    # US variants → united states
+    "us": "united states",
+    "u.s.": "united states",
+    "usa": "united states",
+    "u.s.a.": "united states",
+    "america": "united states",
+    "united states of america": "united states",
 
-    # UAE variants -> united arab emirates
-    "uae":"united arab emirates",
-    "u.a.e.":"united arab emirates",
-    "dubai":"united arab emirates",
-    "abu dhabi":"united arab emirates",
+    # UAE variants → united arab emirates
+    "uae": "united arab emirates",
+    "u.a.e.": "united arab emirates",
+    "dubai": "united arab emirates",
+    "abu dhabi": "united arab emirates",
 
     # Common safe alternates
-    "holland":"netherlands",
-    "czech republic":"czechia",
-    "russian federation":"russia",
-    "viet nam":"vietnam",
-    "republic of korea":"south korea",
-    "korea, south":"south korea",
+    "holland": "netherlands",
+    "czech republic": "czechia",
+    "russian federation": "russia",
+    "viet nam": "vietnam",
+    "republic of korea": "south korea",
+    "korea, south": "south korea",
 }
 
-# Country (canonical key) -> phone region code(s) for phonenumbers parsing/validation.
-# Add more as your campaigns expand.
+def canon_country_key(s) -> str:
+    x = norm_text(s)
+    return COUNTRY_ALIASES_TO_CANON.get(x, x)
+
+
+# For phone validation we map canonical country -> phonenumbers region.
+# Add more if your campaigns include them.
 COUNTRY_TO_REGIONS = {
     "united kingdom": ["GB"],
     "ireland": ["IE"],
@@ -102,23 +107,15 @@ COUNTRY_TO_REGIONS = {
     "portugal": ["PT"],
 }
 
-HIGHLIGHT_FILL = PatternFill(start_color="FFF59D", end_color="FFF59D", fill_type="solid")  # soft yellow
 
-# ------------------ helpers ------------------
-
-def norm_text(s) -> str:
-    """Robust normalizer: fixes case, whitespace, and invisible unicode (NBSP etc.)."""
-    if s is None or (isinstance(s, float) and pd.isna(s)):
-        return ""
-    s = str(s)
-    s = unicodedata.normalize("NFKC", s)
-    s = s.replace("\u00A0", " ")                  # NBSP -> space
-    s = re.sub(r"\s+", " ", s).strip()            # collapse whitespace
-    return s.casefold()                            # stronger than lower()
-
-def canon_country_key(s) -> str:
-    x = norm_text(s)
-    return COUNTRY_ALIASES_TO_CANON.get(x, x)
+# ------------------ Company ↔ domain matching helpers ------------------
+SUFFIXES = {
+    "ltd","limited","co","company","corp","corporation","inc","incorporated",
+    "plc","public","llc","lp","llp","ulc","pc","pllc","sa","ag","nv","se","bv",
+    "oy","ab","aps","as","kft","zrt","rt","sarl","sas","spa","gmbh","ug",
+    "kg","kgaa","pte","pty","sdn","bhd","kk","k.k.","co.","ltd.","inc.","plc.",
+    "holdings","holding","group"
+}
 
 def _normalize_tokens(text: str) -> str:
     if not isinstance(text, str):
@@ -137,10 +134,8 @@ def _clean_domain(domain: str) -> str:
     return domain.strip()
 
 def compare_company_domain(company, domain) -> tuple[str, int, str]:
-    """Heuristic check: does company name plausibly match domain?"""
     c_raw = company if isinstance(company, str) else ""
     d_raw = domain if isinstance(domain, str) else ""
-
     c = _normalize_tokens(c_raw)
     d = _clean_domain(d_raw)
     if not c or not d:
@@ -148,39 +143,26 @@ def compare_company_domain(company, domain) -> tuple[str, int, str]:
 
     d_base = d.split(".")[0] if "." in d else d
     d_base = re.sub(r"[^a-zA-Z0-9]", "", d_base)
-
-    # Strong containment checks
     c_compact = re.sub(r"[^a-zA-Z0-9]", "", c)
+
     if c_compact and c_compact in d_base:
         return "Likely Match", 95, "company contained in domain"
     if d_base and d_base in c_compact:
         return "Likely Match", 90, "domain contained in company"
 
-    # Token containment
-    for token in c.split():
-        if len(token) >= 4 and token in d_base:
-            score = fuzz.partial_ratio(c, d_base)
-            if score >= 70:
-                return "Likely Match", score, "token containment"
-
-    # Brand-ish suffix logic (incl. group/holdings etc.)
-    BRAND_TERMS = {"tx","bio","pharma","therapeutics","labs","health","med","rx","group","holdings"}
-    if any(t in c.split() for t in BRAND_TERMS) and any(t in d for t in BRAND_TERMS):
-        sc = fuzz.partial_ratio(c, d_base)
-        if sc >= 70:
-            return "Likely Match", max(80, sc), "brand term overlap"
-
-    score_full = fuzz.token_sort_ratio(c, d_base)
-    score_partial = fuzz.partial_ratio(c, d_base)
-    score = int(max(score_full, score_partial))
-
-    if score >= THRESHOLD_STRONG:
+    # fuzzy
+    score = int(max(
+        fuzz.token_sort_ratio(c, d_base),
+        fuzz.partial_ratio(c, d_base)
+    ))
+    if score >= 85:
         return "Likely Match", score, "strong fuzzy"
-    elif score >= THRESHOLD_WEAK:
+    if score >= 70:
         return "Unsure – Please Check", score, "weak fuzzy"
-    else:
-        return "Likely NOT Match", score, "low similarity"
+    return "Likely NOT Match", score, "low similarity"
 
+
+# ------------------ Seniority parsing ------------------
 def parse_seniority(title):
     if not isinstance(title, str):
         return "Entry", "no title"
@@ -197,19 +179,20 @@ def parse_seniority(title):
         return "Manager", "manager"
     return "Entry", "default"
 
+
+# ------------------ Phone validation ------------------
 def normalise_phone_for_check(raw_phone: str, region: str) -> str:
     """
-    Clean number just for validation:
-    - strips spaces/brackets/etc.
+    Clean just for validation (does NOT change output phone column):
+    - keeps digits and '+'
     - converts leading 00 to +
-    - if number starts with the region's calling code but lacks '+', add '+'
-    IMPORTANT: this does NOT modify the stored/original value in the output.
+    - if phone starts with the region calling code (e.g. 44) but no '+', add '+'
     """
-    phone = "" if raw_phone is None else str(raw_phone)
-    phone = phone.strip()
+    phone = "" if raw_phone is None else str(raw_phone).strip()
     if not phone:
         return ""
-    phone = re.sub(r"[^\d+]", "", phone)          # keep digits and leading +
+    phone = re.sub(r"[^\d+]", "", phone)
+
     if phone.startswith("00"):
         phone = "+" + phone[2:]
 
@@ -220,34 +203,33 @@ def normalise_phone_for_check(raw_phone: str, region: str) -> str:
         cc = str(country_code_for_region(region))
     except Exception:
         cc = ""
+
     if cc and phone.startswith(cc):
         return "+" + phone
 
     return phone
 
-def phone_country_check(raw_phone, country_standardised_label) -> tuple[str, str]:
+def phone_country_check(raw_phone, country_label) -> tuple[str, str]:
     """
     Returns (Status, Reason)
     Status: Match | Warning | Unsure
     """
     if raw_phone is None or (isinstance(raw_phone, float) and pd.isna(raw_phone)) or str(raw_phone).strip() == "":
         return "Unsure", "Missing phone"
-    if country_standardised_label is None or (isinstance(country_standardised_label, float) and pd.isna(country_standardised_label)) or str(country_standardised_label).strip() == "":
+    if country_label is None or (isinstance(country_label, float) and pd.isna(country_label)) or str(country_label).strip() == "":
         return "Unsure", "Missing country"
 
-    canon = canon_country_key(country_standardised_label)
+    canon = canon_country_key(country_label)
     regions = COUNTRY_TO_REGIONS.get(canon, [])
     if not regions:
-        return "Unsure", f"No phone region mapping for '{country_standardised_label}'"
+        return "Unsure", f"No phone region mapping for '{country_label}'"
 
-    # Try each possible region for that country (usually 1)
     for region in regions:
         phone_for_check = normalise_phone_for_check(raw_phone, region)
         try:
             num = phonenumbers.parse(phone_for_check, region)
-
-            # If the number includes an international code, ensure region matches expectation where possible
             actual_region = phonenumbers.region_code_for_number(num) or ""
+
             if actual_region and actual_region not in regions:
                 return "Warning", f"Parsed region {actual_region} does not match expected {regions}"
 
@@ -258,8 +240,14 @@ def phone_country_check(raw_phone, country_standardised_label) -> tuple[str, str
 
             inferred = ""
             s = str(raw_phone).strip()
-            if (s.startswith("00") or (re.sub(r"[^\d]", "", s).startswith(str(country_code_for_region(region))) and not s.strip().startswith("+"))):
+            digits_only = re.sub(r"[^\d]", "", s)
+            try:
+                cc = str(country_code_for_region(region))
+            except Exception:
+                cc = ""
+            if s.startswith("00") or (cc and digits_only.startswith(cc) and not s.startswith("+")):
                 inferred = " (international prefix inferred)"
+
             return "Match", "Valid for country" + inferred
 
         except Exception:
@@ -267,123 +255,131 @@ def phone_country_check(raw_phone, country_standardised_label) -> tuple[str, str
 
     return "Unsure", "Could not parse phone for supplied country"
 
-# ------------------ main processing ------------------
 
-def run_matching(master_bytes: bytes, picklist_bytes: bytes, highlight_changes: bool = True, progress_cb=None) -> bytes:
+# ------------------ Main processing ------------------
+def run_matching(master_bytes: bytes, picklist_bytes: bytes, highlight_changes: bool, progress_cb=None) -> bytes:
     df_master = pd.read_excel(io.BytesIO(master_bytes))
     df_picklist = pd.read_excel(io.BytesIO(picklist_bytes))
-
-    # EXACT column pairs: (master, picklist)
-    EXACT_PAIRS = [
-        ("companyname","companyname"),
-        ("c_country","c_country"),
-        ("c_state","c_state"),
-        ("lead_country","lead_country"),
-        ("departments","departments"),
-        ("c_industry","c_industry"),
-        ("asset_title","asset_title"),
-    ]
 
     df_out = df_master.copy()
     corrected_cells = set()
 
-    # Build picklist canonical country -> exact picklist label (for target formatting)
+    # Build canonical -> exact picklist label (source of truth formatting)
     picklist_country_label_by_canon = {}
-    for col in ("lead_country", "c_country"):
+    for col in ("lead_country", "c_country", "country"):
         if col in df_picklist.columns:
             for v in df_picklist[col].dropna().astype(str):
-                v_str = v.strip()
-                if not v_str:
-                    continue
-                picklist_country_label_by_canon[canon_country_key(v_str)] = v_str
+                v = v.strip()
+                if v:
+                    picklist_country_label_by_canon[canon_country_key(v)] = v
+
+    # Pairs where we try to match master values to picklist values (case/space-insensitive)
+    EXACT_PAIRS = [
+        ("companyname", "companyname"),
+        ("c_country", "c_country"),
+        ("c_state", "c_state"),
+        ("lead_country", "lead_country"),
+        ("departments", "departments"),
+        ("c_industry", "c_industry"),
+        ("asset_title", "asset_title"),
+    ]
 
     if progress_cb:
-        progress_cb(0.35, text="Matching Master ↔ Picklist (exact checks)...")
+        progress_cb(0.15, "Running picklist checks...")
 
-    for master_col, picklist_col in EXACT_PAIRS:
+    for master_col, pick_col in EXACT_PAIRS:
         out_col = f"Match_{master_col}"
-        if master_col in df_master.columns and picklist_col in df_picklist.columns:
-            pick_map = {norm_text(v): str(v).strip() for v in df_picklist[picklist_col].dropna().astype(str)}
-            matches, new_vals = [], []
-
-            for i, val in enumerate(df_master[master_col].fillna("").astype(str)):
-                raw_val = val
-                key = norm_text(raw_val)
-
-                # Country canonicalisation -> picklist spelling
-                if master_col.strip().lower() in {"lead_country", "c_country", "country"}:
-                    canon = canon_country_key(raw_val)
-                    if canon in picklist_country_label_by_canon:
-                        desired_label = picklist_country_label_by_canon[canon]
-                        key = norm_text(desired_label)
-
-                if key in pick_map:
-                    matches.append("Yes")
-                    new_val = pick_map[key]
-
-                    if master_col.strip().lower() in {"lead_country","c_country","country"}:
-                        canon = canon_country_key(raw_val)
-                        new_val = picklist_country_label_by_canon.get(canon, new_val)
-
-                    new_vals.append(new_val)
-                    if str(new_val).strip() != str(raw_val).strip():
-                        corrected_cells.add((master_col, i + 2))  # +2 because header is row 1
-                else:
-                    matches.append("No")
-                    new_vals.append(raw_val)
-
-            df_out[out_col] = matches
-            df_out[master_col] = new_vals
-        else:
+        if master_col not in df_master.columns or pick_col not in df_picklist.columns:
             df_out[out_col] = "Column Missing"
+            continue
 
-    # Audit columns: standardised country + change note
-    if "lead_country" in df_out.columns:
-        std_vals, notes = [], []
-        for v in df_out["lead_country"].fillna("").astype(str):
-            canon = canon_country_key(v)
-            std = picklist_country_label_by_canon.get(canon, str(v).strip())
-            std_vals.append(std)
-            notes.append(f"{v} → {std}" if norm_text(std) and norm_text(v) and norm_text(std) != norm_text(v) else "")
-        df_out["Country_Standardised"] = std_vals
-        df_out["Country_Change_Note"] = notes
-    elif "c_country" in df_out.columns:
-        std_vals, notes = [], []
-        for v in df_out["c_country"].fillna("").astype(str):
-            canon = canon_country_key(v)
-            std = picklist_country_label_by_canon.get(canon, str(v).strip())
-            std_vals.append(std)
-            notes.append(f"{v} → {std}" if norm_text(std) and norm_text(v) and norm_text(std) != norm_text(v) else "")
-        df_out["Country_Standardised"] = std_vals
-        df_out["Country_Change_Note"] = notes
+        # picklist map: normalized -> exact label
+        pick_map = {norm_text(v): str(v).strip() for v in df_picklist[pick_col].dropna().astype(str)}
 
-    # Seniority parse
+        matches = []
+        new_vals = []
+
+        for i, raw_val in enumerate(df_master[master_col].fillna("").astype(str)):
+            v = raw_val
+
+            # If this is a country column, standardise to picklist label first (England -> United Kingdom)
+            if master_col.strip().lower() in {"lead_country", "c_country", "country"}:
+                canon = canon_country_key(v)
+                if canon in picklist_country_label_by_canon:
+                    v = picklist_country_label_by_canon[canon]
+
+            key = norm_text(v)
+            if key in pick_map:
+                matches.append("Yes")
+                desired = pick_map[key]
+                new_vals.append(desired)
+
+                # Only mark as corrected if the visible value changed
+                if str(desired).strip() != str(raw_val).strip():
+                    corrected_cells.add((master_col, i + 2))  # excel row index (+ header)
+            else:
+                matches.append("No")
+                new_vals.append(v)
+
+        df_out[out_col] = matches
+        df_out[master_col] = new_vals
+
+    # Country audit columns (using whichever is present)
     if progress_cb:
-        progress_cb(0.55, text="Parsing seniority...")
+        progress_cb(0.30, "Standardising countries...")
 
-    if "jobtitle" in df_master.columns:
-        parsed = df_master["jobtitle"].apply(parse_seniority)
+    country_base_col = None
+    for c in ["lead_country", "c_country", "country"]:
+        if c in df_out.columns:
+            country_base_col = c
+            break
+
+    if country_base_col:
+        std_vals, notes = [], []
+        for raw in df_out[country_base_col].fillna("").astype(str):
+            canon = canon_country_key(raw)
+            std = picklist_country_label_by_canon.get(canon, raw.strip())
+            std_vals.append(std)
+            notes.append(f"{raw} → {std}" if norm_text(raw) and norm_text(std) and norm_text(raw) != norm_text(std) else "")
+        df_out["Country_Standardised"] = std_vals
+        df_out["Country_Change_Note"] = notes
+
+    # Seniority
+    if progress_cb:
+        progress_cb(0.45, "Parsing seniority...")
+
+    if "jobtitle" in df_out.columns:
+        parsed = df_out["jobtitle"].apply(parse_seniority)
         df_out["Parsed_Seniority"] = parsed.apply(lambda x: x[0])
         df_out["Seniority_Logic"] = parsed.apply(lambda x: x[1])
     else:
-        df_out["Parsed_Seniority"] = None
+        df_out["Parsed_Seniority"] = ""
         df_out["Seniority_Logic"] = "jobtitle column not found"
 
-    # Company ↔ domain validation
+    # Company/domain check
     if progress_cb:
-        progress_cb(0.70, text="Validating company ↔ domain...")
+        progress_cb(0.60, "Checking company vs domain...")
 
-    company_cols = [c for c in df_master.columns if c.strip().lower() in {"companyname","company","company name","company_name"}]
-    domain_cols  = [c for c in df_master.columns if c.strip().lower() in {"website","domain","email domain","email_domain","company_domain","company domain"}]
-    email_cols   = [c for c in df_master.columns if "email" in c.lower()]
+    company_col = None
+    for c in df_master.columns:
+        if c.strip().lower() in {"companyname", "company", "company name", "company_name"}:
+            company_col = c
+            break
 
-    if company_cols:
-        company_col = company_cols[0]
-        domain_col  = domain_cols[0] if domain_cols else None
-        email_col   = email_cols[0] if email_cols else None
+    domain_col = None
+    for c in df_master.columns:
+        if c.strip().lower() in {"website", "domain", "email domain", "email_domain", "company_domain", "company domain"}:
+            domain_col = c
+            break
 
+    email_col = None
+    for c in df_master.columns:
+        if c.strip().lower() == "email" or "email" in c.lower():
+            email_col = c
+            break
+
+    if company_col:
         statuses, scores, reasons = [], [], []
-
         for i in range(len(df_master)):
             comp = df_master.at[i, company_col]
             dom = None
@@ -408,33 +404,32 @@ def run_matching(master_bytes: bytes, picklist_bytes: bytes, highlight_changes: 
         df_out["Company_Domain_Score"] = 0
         df_out["Company_Domain_Reason"] = "company column not found"
 
-    # Phone ↔ country validation (does NOT modify phone value)
+    # Phone/country check (does not modify phone values)
     if progress_cb:
-        progress_cb(0.82, text="Validating phone ↔ country...")
+        progress_cb(0.78, "Checking phone vs country...")
 
-    country_for_phone_col = (
-        "Country_Standardised" if "Country_Standardised" in df_out.columns
-        else ("lead_country" if "lead_country" in df_out.columns
-              else ("c_country" if "c_country" in df_out.columns else None))
-    )
+    country_for_phone = "Country_Standardised" if "Country_Standardised" in df_out.columns else country_base_col
 
-    phone_candidates = []
+    # Detect phone columns
+    phone_cols = []
     for c in df_master.columns:
         cl = c.strip().lower()
-        if cl in {"phone","phone_main","phonemain","phone main","phone number","phonenumber",
-                  "mobile","mobilephone","phone_mobile","phonemobile","phone mobile"}:
-            phone_candidates.append(c)
+        if cl in {
+            "phone", "phone_main", "phonemain", "phone main", "phone number", "phonenumber",
+            "mobile", "mobilephone", "phone_mobile", "phonemobile", "phone mobile"
+        }:
+            phone_cols.append(c)
 
-    if country_for_phone_col and phone_candidates:
-        for phone_col in phone_candidates:
-            st_col = f"{phone_col}_PhoneCountry_Status"
-            rs_col = f"{phone_col}_PhoneCountry_Reason"
+    if country_for_phone and phone_cols:
+        for pc in phone_cols:
+            st_col = f"{pc}_PhoneCountry_Status"
+            rs_col = f"{pc}_PhoneCountry_Reason"
             out_status, out_reason = [], []
 
             for i in range(len(df_master)):
-                raw_phone = df_master.at[i, phone_col]
-                country_label = df_out.at[i, country_for_phone_col]
-                s, r = phone_country_check(raw_phone, country_label)
+                raw_phone = df_master.at[i, pc]
+                ctry = df_out.at[i, country_for_phone]
+                s, r = phone_country_check(raw_phone, ctry)
                 out_status.append(s)
                 out_reason.append(r)
 
@@ -444,20 +439,39 @@ def run_matching(master_bytes: bytes, picklist_bytes: bytes, highlight_changes: 
         df_out["PhoneCountry_Status"] = "phone or country column not found"
         df_out["PhoneCountry_Reason"] = ""
 
+    # Required fields completeness (only if those columns exist)
+    if progress_cb:
+        progress_cb(0.90, "Checking required fields...")
+
+    required_candidates = ["email", "firstname", "lastname", "jobtitle", "companyname", "lead_country"]
+    existing_required = [c for c in required_candidates if c in df_out.columns]
+
+    if existing_required:
+        missing_list = []
+        for i in range(len(df_out)):
+            missing = []
+            for c in existing_required:
+                v = df_out.at[i, c]
+                if v is None or (isinstance(v, float) and pd.isna(v)) or str(v).strip() == "":
+                    missing.append(c)
+            missing_list.append(", ".join(missing))
+        df_out["Missing_Required_Fields"] = missing_list
+
     # Write to Excel
+    if progress_cb:
+        progress_cb(0.95, "Writing Excel output...")
+
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df_out.to_excel(writer, index=False, sheet_name="Results")
-
     output.seek(0)
 
-    # Highlight corrected cells (only where we overwrote to picklist label)
+    # Highlight corrected cells (slow on huge files, but optional)
     if highlight_changes and corrected_cells:
         wb = load_workbook(output)
         ws = wb["Results"]
-
         header = [cell.value for cell in ws[1]]
-        col_index = {str(v): i+1 for i, v in enumerate(header)}
+        col_index = {str(v): i + 1 for i, v in enumerate(header)}
 
         for col_name, row_num in corrected_cells:
             if col_name in col_index:
@@ -470,13 +484,13 @@ def run_matching(master_bytes: bytes, picklist_bytes: bytes, highlight_changes: 
 
     return output.read()
 
-# ------------------ Streamlit UI ------------------
 
+# ------------------ Streamlit UI ------------------
 st.markdown("## Lead Quality Checker")
 st.caption(
-    "Upload the Lead Master + Picklist. The tool checks exact picklist matches, "
-    "standardises countries to picklist format, validates company↔domain, and validates "
-    "phone↔country (without changing phone values)."
+    "Upload the Lead Master + Picklist. Click **Run matching** to generate the output. "
+    "Countries are standardised to the picklist format. Phone checks run in the background "
+    "(the phone value in your output stays unchanged)."
 )
 
 col1, col2 = st.columns(2)
@@ -485,10 +499,22 @@ with col1:
 with col2:
     picklist_file = st.file_uploader("Upload Picklist (.xlsx)", type=["xlsx"], key="picklist")
 
-highlight = st.toggle("Highlight corrected cells (yellow)", value=True)
+# Highlighting can slow big files — default OFF for speed
+highlight = st.toggle("Highlight corrected cells (yellow)", value=False)
 
-if master_file and picklist_file:
-    progress = st.progress(0.0, text="Ready")
+# Keep last result in session so toggling doesn't re-run automatically
+if "last_output_bytes" not in st.session_state:
+    st.session_state.last_output_bytes = None
+
+run_btn = st.button(
+    "▶ Run matching",
+    type="primary",
+    use_container_width=True,
+    disabled=not (master_file and picklist_file),
+)
+
+if run_btn:
+    progress = st.progress(0.0, text="Starting...")
 
     def prog(p, text=""):
         progress.progress(min(max(float(p), 0.0), 1.0), text=text)
@@ -500,13 +526,17 @@ if master_file and picklist_file:
             highlight_changes=highlight,
             progress_cb=prog
         )
+        st.session_state.last_output_bytes = output_bytes
         st.success("Processing complete.")
-        st.download_button(
-            label="Download Processed File",
-            data=output_bytes,
-            file_name="Full_Check_Results.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True
-        )
     except Exception as e:
+        st.session_state.last_output_bytes = None
         st.error(f"Error: {e}")
+
+if st.session_state.last_output_bytes:
+    st.download_button(
+        label="⬇ Download Processed File",
+        data=st.session_state.last_output_bytes,
+        file_name="Full_Check_Results.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True
+    )
