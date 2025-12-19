@@ -409,16 +409,20 @@ def run_matching(master_bytes: bytes, picklist_bytes: bytes, apply_colours: bool
     df_picklist = pd.read_excel(io.BytesIO(picklist_bytes), dtype=str, keep_default_na=False)
 
     df_out = df_master.copy()
+    colmap = detect_columns(df_master, df_picklist)
+
     added_cols = []  # track new columns for yellow header highlight
 
     # Build canonical -> exact picklist label (source of truth formatting)
-    picklist_country_label_by_canon = {}
-    for col in ("lead_country", "c_country", "country"):
-        if col in df_picklist.columns:
-            for v in df_picklist[col]:
-                v = str(v).strip()
-                if v:
-                    picklist_country_label_by_canon[canon_country_key(v)] = v
+   picklist_country_label_by_canon = {}
+
+pick_country_col = colmap.get("pick_country")
+if pick_country_col:
+    for v in df_picklist[pick_country_col]:
+        v = str(v).strip()
+        if v:
+            picklist_country_label_by_canon[canon_country_key(v)] = v
+
 
     # Exact pairs (master col, picklist col)
     EXACT_PAIRS = [
