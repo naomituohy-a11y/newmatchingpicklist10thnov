@@ -368,15 +368,16 @@ def phone_country_check(raw_phone, country_label) -> tuple[str, str]:
             num = phonenumbers.parse(phone_for_check, region)
             actual_region = phonenumbers.region_code_for_number(num) or ""
 
-# Treat NANP (US/CA) as acceptable either way
-expected_set = set(regions)
-nanp_set = {"US", "CA"}
-if actual_region and actual_region not in expected_set:
-    if expected_set.issubset(nanp_set) and actual_region in nanp_set:
-        # allow CA when expecting US, and US when expecting CA
-        pass
-    else:
-        return "Warning", f"Parsed region {actual_region} != expected {regions}"
+            # Treat NANP (US/CA) as acceptable either way
+            expected_set = set(regions)
+            nanp_set = {"US", "CA"}
+
+            if actual_region and actual_region not in expected_set:
+                if expected_set.issubset(nanp_set) and actual_region in nanp_set:
+                    # allow CA when expecting US, and US when expecting CA
+                    pass
+                else:
+                    return "Warning", f"Parsed region {actual_region} != expected {regions}"
 
             if not phonenumbers.is_possible_number(num):
                 return "Warning", "Number not possible for country"
@@ -386,7 +387,6 @@ if actual_region and actual_region not in expected_set:
             return "Match", "Valid for country"
         except Exception:
             continue
-
     return "Unsure", "Could not parse phone for supplied country"
 
 
