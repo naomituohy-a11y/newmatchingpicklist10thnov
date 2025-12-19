@@ -12,6 +12,66 @@ from openpyxl.styles import PatternFill
 import phonenumbers
 from phonenumbers.phonenumberutil import country_code_for_region
 
+def _clean_header(h) -> str:
+    h = "" if h is None else str(h)
+    h = h.strip().lower()
+    h = re.sub(r"\s+", " ", h)
+    return h
+
+def find_best_column(df: pd.DataFrame, keywords, banned=(), prefer_startswith=True):
+    """
+    Returns the best matching column name from df based on header keywords.
+    """
+    cols = list(df.columns)
+    scored = []
+
+    for c in cols:
+        hc = _clean_header(c)
+
+        if any(b in hc for b in banned):
+            continue
+
+        score = 0
+        for kw in keywords:
+            kw = kw.lower()
+            if kw in hc:
+                score += 10
+            if prefer_startswith and hc.startswith(kw):
+                score += 3
+
+        # slight preference for shorter headers (e.g. "country")
+        score += max(0, 5 - len(hc.split()))
+
+        if score > 0:
+            scored.append((score, c))
+
+    scored.sort(reverse=True, key=lambda x: x[0])
+    return scored[0][1] if scored else None
+
+
+def detect_columns(master_df: pd.DataFrame, pick_df: pd.DataFrame):
+    """
+    Detects likely columns by meaning instead of exact header names.
+    """
+    return {
+        # MASTER
+        "master_company": find_best_column(master_df, ["companyname", "company name", "company"], banned=["domain", "website"]),
+        "master_country": find_best_column(master_df, ["lead_country", "company country", "country"], banned=["county"]),
+        "master_industry": find_best_column(master_df, ["industry", "c_industry"], banned=[]),
+        "master_departments": find_best_column(master_df, ["department", "departments", "function"], banned=[]),
+        "master_asset_title": find_best_column(master_df, ["asset_title", "asset title", "asset"], banned=[]),
+        "master_phone": find_best_column(master_df, ["telephone", "phone", "tel", "mobile", "cell"], banned=["phonetic"]),
+        "master_website": find_best_column(master_df, ["website", "domain", "web", "url"], banned=["email"]),
+        "master_email": find_best_column(master_df, ["email"], banned=[]),
+
+        # PICKLIST
+        "pick_country": find_best_column(pick_df, ["lead_country", "country", "company country"], banned=["county"]),
+        "pick_industry": find_best_column(pick_df, ["industry", "c_industry"], banned=[]),
+        "pick_departments": find_best_column(pick_df, ["department", "departments", "function"], banned=[]),
+        "pick_asset_title": find_best_column(pick_df, ["asset_title", "asset title", "asset"], banned=[]),
+    }
+
+
 
 # ------------------ UI / Page config ------------------
 st.set_page_config(page_title="Lead Quality Checker", page_icon="✅", layout="wide")
