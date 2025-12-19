@@ -50,6 +50,14 @@ def norm_picklist_value(s) -> str:
     return x
 
 
+def looks_like_datetime_string(s: str) -> bool:
+    """Detects dd/mm/yyyy or dd/mm/yyyy hh:mm:ss strings (so we can keep them as TEXT in Excel)."""
+    if not isinstance(s, str):
+        return False
+    s = s.strip()
+    return bool(re.fullmatch(r"\d{2}/\d{2}/\d{4}( \d{2}:\d{2}:\d{2})?", s))
+
+
 # ------------------ Flexible header detection ------------------
 def _clean_header(h) -> str:
     h = "" if h is None else str(h)
@@ -97,7 +105,7 @@ def detect_columns(master_df: pd.DataFrame, pick_df: pd.DataFrame):
         "master_email": find_best_column(master_df, ["email"], banned=[]),
         "master_jobtitle": find_best_column(master_df, ["jobtitle", "job title", "title"], banned=[]),
 
-        # NEW: Seniority picklist-based standardisation (Master → Picklist)
+        # Picklist-based standardisation (Master → Picklist)
         "master_seniority": find_best_column(master_df, ["seniority", "senior"], banned=[]),
 
         # PICKLIST
@@ -105,8 +113,6 @@ def detect_columns(master_df: pd.DataFrame, pick_df: pd.DataFrame):
         "pick_industry": find_best_column(pick_df, ["industry", "c_industry"], banned=[]),
         "pick_departments": find_best_column(pick_df, ["department", "departments", "function"], banned=[]),
         "pick_asset_title": find_best_column(pick_df, ["asset_title", "asset title", "asset"], banned=[]),
-
-        # NEW: Seniority in picklist
         "pick_seniority": find_best_column(pick_df, ["seniority", "senior"], banned=[]),
     }
 
@@ -291,10 +297,8 @@ def compare_company_domain(company, domain) -> tuple[str, int, str]:
 
 # ------------------ Seniority parsing (derived; NOT picklist overwrite) ------------------
 def parse_seniority(title):
-    # derived classification from job title text
     if not isinstance(title, str):
         return "Entry"
-
     t = norm_text(title)
 
     if re.search(r"\b(chief|ceo|cfo|cio|cto|coo|chro|president)\b", t):
@@ -371,11 +375,9 @@ def phone_country_check(raw_phone, country_label) -> tuple[str, str]:
             # Treat NANP (US/CA) as acceptable either way
             expected_set = set(regions)
             nanp_set = {"US", "CA"}
-
             if actual_region and actual_region not in expected_set:
                 if expected_set.issubset(nanp_set) and actual_region in nanp_set:
-                    # allow CA when expecting US, and US when expecting CA
-                    pass
+                    pass  # allow US <-> CA
                 else:
                     return "Warning", f"Parsed region {actual_region} != expected {regions}"
 
@@ -387,6 +389,7 @@ def phone_country_check(raw_phone, country_label) -> tuple[str, str]:
             return "Match", "Valid for country"
         except Exception:
             continue
+
     return "Unsure", "Could not parse phone for supplied country"
 
 
@@ -409,9 +412,6 @@ def run_matching(master_bytes: bytes, picklist_bytes: bytes, apply_colours: bool
             if v:
                 picklist_country_label_by_canon[canon_country_key(v)] = v
 
-    # These are the columns we will standardise:
-    # - match master → picklist using normalised key
-    # - overwrite master value ONLY when there is an exact normalised match
     EXACT_PAIRS = [
         ("country", colmap.get("master_country"), colmap.get("pick_country")),
         ("industry", colmap.get("master_industry"), colmap.get("pick_industry")),
@@ -437,7 +437,11 @@ def run_matching(master_bytes: bytes, picklist_bytes: bytes, apply_colours: bool
         if not master_col or not pick_col:
             continue
 
-        # Picklist map: normalised key -> exact picklist text (bible formatting)
+        # Safety: never standardise date/time columns if column detection went wrong
+        if "date" in _clean_header(master_col) or "time" in _clean_header(master_col):
+            df_out[out_col] = "Skipped (date/time column)"
+            continue
+
         pick_map = {
             norm_picklist_value(v): str(v).strip()
             for v in df_picklist[pick_col]
@@ -450,7 +454,6 @@ def run_matching(master_bytes: bytes, picklist_bytes: bytes, apply_colours: bool
         for raw_val in df_master[master_col]:
             v = str(raw_val)
 
-            # Special handling: country canon -> force to picklist format where possible
             if friendly == "country":
                 canon = canon_country_key(v)
                 if canon in picklist_country_label_by_canon:
@@ -458,18 +461,17 @@ def run_matching(master_bytes: bytes, picklist_bytes: bytes, apply_colours: bool
 
             key = norm_picklist_value(v)
 
-            # ONLY overwrite when we are sure: exact match on normalised key
             if key in pick_map:
                 matches.append("Yes")
-                new_vals.append(pick_map[key])  # overwrite to picklist formatting
+                new_vals.append(pick_map[key])
             else:
                 matches.append("No")
-                new_vals.append(v)  # keep original
+                new_vals.append(v)
 
         df_out[out_col] = matches
         df_out[master_col] = new_vals
 
-    # Change notes for every standardised field (Country/Seniority/etc.)
+    # Change notes for every standardised field
     if progress_cb:
         progress_cb(0.30, "Auditing changes...")
 
@@ -645,6 +647,19 @@ def run_matching(master_bytes: bytes, picklist_bytes: bytes, apply_colours: bool
     wb = load_workbook(output)
     ws = wb["Results"]
 
+    # ---- Preserve dd/mm/yyyy and dd/mm/yyyy hh:mm:ss exactly as text (stop Excel reformatting) ----
+    for col_idx in range(1, ws.max_column + 1):
+        sample_vals = [
+            ws.cell(row=r, column=col_idx).value
+            for r in range(2, min(ws.max_row, 20) + 1)
+        ]
+        if any(isinstance(v, str) and looks_like_datetime_string(v) for v in sample_vals):
+            for r in range(2, ws.max_row + 1):
+                v = ws.cell(row=r, column=col_idx).value
+                if isinstance(v, str) and looks_like_datetime_string(v):
+                    ws.cell(row=r, column=col_idx).number_format = "@"
+                    ws.cell(row=r, column=col_idx).value = v
+
     headers = [cell.value for cell in ws[1]]
     col_index_raw = {("" if v is None else str(v)): i + 1 for i, v in enumerate(headers)}
     col_index_clean = {_clean_header(v): i + 1 for i, v in enumerate(headers)}
@@ -751,7 +766,8 @@ st.caption(
     "📞 Phone validation runs in the background and does NOT change your phone field.\n"
     "🌍 Country names are standardised to the picklist format where possible (e.g. GB/England → United Kingdom).\n"
     "🧩 Picklist matching treats '&' and 'and' as equivalent (e.g. Travel & Tourism).\n"
-    "📌 Any master value overwritten to match picklist formatting is highlighted."
+    "📌 Any master value overwritten to match picklist formatting is highlighted.\n"
+    "🗓 Date/time values in dd/mm/yyyy (and dd/mm/yyyy hh:mm:ss) are preserved exactly as entered."
 )
 
 col1, col2 = st.columns(2)
