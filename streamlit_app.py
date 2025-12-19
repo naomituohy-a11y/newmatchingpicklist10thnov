@@ -30,6 +30,28 @@ def norm_text(s) -> str:
     s = s.replace("\u00A0", " ")
     s = re.sub(r"\s+", " ", s).strip()
     return s.casefold()
+def norm_picklist_value(s) -> str:
+    """
+    Strict normalisation for picklist comparisons only.
+    Safe equivalences:
+    - case-insensitive
+    - '&' treated same as 'and'
+    - punctuation differences ignored
+    """
+    x = norm_text(s)
+
+    # treat "&" and "and" as equivalent
+    x = x.replace("&", " and ")
+
+    # normalise punctuation differences
+    x = x.replace(",", " ")
+    x = x.replace("/", " ")
+    x = x.replace("-", " ")
+
+    # collapse spaces again
+    x = re.sub(r"\s+", " ", x).strip()
+
+    return x
 
 
 # ------------------ Flexible header detection ------------------
