@@ -19,6 +19,7 @@ st.set_page_config(page_title="Lead Quality Checker", page_icon="✅", layout="w
 HEADER_YELLOW = PatternFill(start_color="FFF59D", end_color="FFF59D", fill_type="solid")
 CELL_GREEN = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
 CELL_BLUE = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+CELL_CHANGE = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")  # changed cell highlight
 
 
 # ------------------ Normalisation helpers ------------------
@@ -57,6 +58,7 @@ def _clean_header(h) -> str:
     h = re.sub(r"\s+", " ", h)
     return h
 
+
 def find_best_column(df: pd.DataFrame, keywords, banned=(), prefer_startswith=True):
     cols = list(df.columns)
     scored = []
@@ -81,6 +83,7 @@ def find_best_column(df: pd.DataFrame, keywords, banned=(), prefer_startswith=Tr
 
     scored.sort(reverse=True, key=lambda x: x[0])
     return scored[0][1] if scored else None
+
 
 def detect_columns(master_df: pd.DataFrame, pick_df: pd.DataFrame):
     return {
@@ -139,9 +142,11 @@ COUNTRY_ALIASES_TO_CANON = {
     "korea, south": "south korea",
 }
 
+
 def canon_country_key(s) -> str:
     x = norm_text(s)
     return COUNTRY_ALIASES_TO_CANON.get(x, x)
+
 
 COUNTRY_TO_REGIONS = {
     "united kingdom": ["GB"],
@@ -187,6 +192,7 @@ SUFFIXES = {
     "holdings","holding","group"
 }
 
+
 def _clean_domain(domain: str) -> str:
     if not isinstance(domain, str):
         return ""
@@ -196,6 +202,7 @@ def _clean_domain(domain: str) -> str:
     domain = domain.replace("www.", "")
     return domain.strip()
 
+
 def _domain_base(domain: str) -> str:
     d = _clean_domain(domain)
     if not d:
@@ -204,12 +211,14 @@ def _domain_base(domain: str) -> str:
     base = re.sub(r"[^a-z0-9]", "", base.lower())
     return base
 
+
 COUNTRY_WORDS_FOR_ACRONYM = {
     "uk", "u.k", "gb", "great", "britain", "england", "scotland", "wales", "ireland",
     "usa", "us", "u.s", "united", "states", "america",
     "uae", "u.a.e", "dubai", "abu", "dhabi",
 }
 STOPWORDS = {"of", "and", "the", "for", "to", "a"}
+
 
 def _company_tokens(company: str) -> list[str]:
     if not isinstance(company, str):
@@ -226,15 +235,18 @@ def _company_tokens(company: str) -> list[str]:
     toks = [t for t in toks if t not in COUNTRY_WORDS_FOR_ACRONYM]
     return toks
 
+
 def _company_acronym(company: str) -> str:
     toks = _company_tokens(company)
     if not toks:
         return ""
     return "".join(t[0] for t in toks if t).upper()
 
+
 def _is_subsequence(short: str, long: str) -> bool:
     it = iter(long)
     return all(ch in it for ch in short)
+
 
 def compare_company_domain(company, domain) -> tuple[str, int, str]:
     c_raw = company if isinstance(company, str) else ""
@@ -310,6 +322,7 @@ def phone_to_string(raw_phone) -> str:
 
     return s
 
+
 def normalise_phone_for_check(raw_phone: str, region: str) -> str:
     phone = phone_to_string(raw_phone)
     phone = re.sub(r"[^\d+]", "", phone)
@@ -328,6 +341,7 @@ def normalise_phone_for_check(raw_phone: str, region: str) -> str:
         return "+" + phone
 
     return phone
+
 
 def phone_country_check(raw_phone, country_label) -> tuple[str, str]:
     if raw_phone is None or str(raw_phone).strip() == "":
@@ -370,6 +384,8 @@ def run_matching(master_bytes: bytes, picklist_bytes: bytes, apply_colours: bool
     added_cols = []
 
     colmap = detect_columns(df_master, df_picklist)
+
+    master_country_col = colmap.get("master_country")
 
     # Build picklist "source of truth" country labels
     picklist_country_label_by_canon = {}
@@ -431,7 +447,6 @@ def run_matching(master_bytes: bytes, picklist_bytes: bytes, apply_colours: bool
     if progress_cb:
         progress_cb(0.30, "Standardising countries...")
 
-    master_country_col = colmap.get("master_country")
     if master_country_col:
         std_vals, notes = [], []
         for raw in df_out[master_country_col]:
@@ -615,14 +630,34 @@ def run_matching(master_bytes: bytes, picklist_bytes: bytes, apply_colours: bool
             else:
                 ws.cell(row=r, column=cidx).fill = CELL_BLUE
 
+    # Match_* columns
     for mc in match_cols:
         fill_column(mc, lambda v: norm_text(v) == "yes")
 
+    # Company domain status
     fill_column("Company_Domain_Status", lambda v: norm_text(v) in {"likely match", "match"})
 
+    # Phone status columns (Match vs not)
     for pc in phone_status_cols:
         fill_column(pc, lambda v: norm_text(v) == "match")
 
+    # Phone reason columns (Valid for country vs not)
+    phone_reason_cols = [c for c in df_out.columns if c.endswith("_PhoneCountry_Reason")] + (
+        ["PhoneCountry_Reason"] if "PhoneCountry_Reason" in df_out.columns else []
+    )
+    for rc in phone_reason_cols:
+        fill_column(rc, lambda v: norm_text(v) == "valid for country")
+
+    # Highlight COUNTRY cells where a change was made (based on Country_Change_Note)
+    if master_country_col and "Country_Change_Note" in col_index and master_country_col in col_index:
+        note_idx = col_index["Country_Change_Note"]
+        country_idx = col_index[master_country_col]
+        for r in range(2, max_row + 1):
+            note_val = ws.cell(row=r, column=note_idx).value
+            if note_val is not None and str(note_val).strip() != "":
+                ws.cell(row=r, column=country_idx).fill = CELL_CHANGE
+
+    # Missing required fields
     if "Missing_Required_Fields" in col_index:
         cidx = col_index["Missing_Required_Fields"]
         for r in range(2, max_row + 1):
@@ -632,8 +667,8 @@ def run_matching(master_bytes: bytes, picklist_bytes: bytes, apply_colours: bool
             else:
                 ws.cell(row=r, column=cidx).fill = CELL_BLUE
 
+    # Overall status + issues
     fill_column("Overall_Status", lambda v: norm_text(v) == "pass")
-
     if "Overall_Issues" in col_index:
         cidx = col_index["Overall_Issues"]
         for r in range(2, max_row + 1):
