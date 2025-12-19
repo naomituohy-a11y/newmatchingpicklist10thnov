@@ -37,6 +37,7 @@ def norm_picklist_value(s) -> str:
     """
     Strict normalisation for picklist comparisons only.
     Safe equivalences:
+    - Case/spacing differences ignored
     - '&' treated same as 'and'
     - punctuation differences ignored
     """
@@ -96,11 +97,17 @@ def detect_columns(master_df: pd.DataFrame, pick_df: pd.DataFrame):
         "master_email": find_best_column(master_df, ["email"], banned=[]),
         "master_jobtitle": find_best_column(master_df, ["jobtitle", "job title", "title"], banned=[]),
 
+        # NEW: Seniority picklist-based standardisation (Master → Picklist)
+        "master_seniority": find_best_column(master_df, ["seniority", "senior"], banned=[]),
+
         # PICKLIST
         "pick_country": find_best_column(pick_df, ["lead_country", "country", "company country"], banned=["county"]),
         "pick_industry": find_best_column(pick_df, ["industry", "c_industry"], banned=[]),
         "pick_departments": find_best_column(pick_df, ["department", "departments", "function"], banned=[]),
         "pick_asset_title": find_best_column(pick_df, ["asset_title", "asset title", "asset"], banned=[]),
+
+        # NEW: Seniority in picklist
+        "pick_seniority": find_best_column(pick_df, ["seniority", "senior"], banned=[]),
     }
 
 
@@ -228,7 +235,6 @@ def _company_tokens(company: str) -> list[str]:
 
     # remove suffixes, but keep "group"
     toks = [t for t in toks if (t not in SUFFIXES) or (t == "group")]
-
     toks = [t for t in toks if t not in STOPWORDS]
     toks = [t for t in toks if t not in COUNTRY_WORDS_FOR_ACRONYM]
     return toks
@@ -283,14 +289,17 @@ def compare_company_domain(company, domain) -> tuple[str, int, str]:
     return "Likely NOT Match", score, "low similarity"
 
 
-# ------------------ Seniority parsing ------------------
+# ------------------ Seniority parsing (derived; NOT picklist overwrite) ------------------
 def parse_seniority(title):
+    # derived classification from job title text
     if not isinstance(title, str):
         return "Entry"
-    t = title.lower().strip()
-    if re.search(r"\bchief\b|\bcio\b|\bcto\b|\bceo\b|\bcfo\b|\bcoo\b|\bchro\b|\bpresident\b", t):
+
+    t = norm_text(title)
+
+    if re.search(r"\b(chief|ceo|cfo|cio|cto|coo|chro|president)\b", t):
         return "C Suite"
-    if re.search(r"\bvice president\b|\bvp\b|\bsvp\b", t):
+    if re.search(r"\b(senior vice president|svp|vice president|vp)\b", t):
         return "VP"
     if re.search(r"\bhead\b", t):
         return "Head"
@@ -298,6 +307,7 @@ def parse_seniority(title):
         return "Director"
     if re.search(r"\bmanager\b", t):
         return "Manager"
+
     return "Entry"
 
 
@@ -358,8 +368,15 @@ def phone_country_check(raw_phone, country_label) -> tuple[str, str]:
             num = phonenumbers.parse(phone_for_check, region)
             actual_region = phonenumbers.region_code_for_number(num) or ""
 
-            if actual_region and actual_region not in regions:
-                return "Warning", f"Parsed region {actual_region} != expected {regions}"
+# Treat NANP (US/CA) as acceptable either way
+expected_set = set(regions)
+nanp_set = {"US", "CA"}
+if actual_region and actual_region not in expected_set:
+    if expected_set.issubset(nanp_set) and actual_region in nanp_set:
+        # allow CA when expecting US, and US when expecting CA
+        pass
+    else:
+        return "Warning", f"Parsed region {actual_region} != expected {regions}"
 
             if not phonenumbers.is_possible_number(num):
                 return "Warning", "Number not possible for country"
@@ -382,10 +399,6 @@ def run_matching(master_bytes: bytes, picklist_bytes: bytes, apply_colours: bool
     added_cols = []
 
     colmap = detect_columns(df_master, df_picklist)
-    master_country_col = colmap.get("master_country")
-
-    # Store ORIGINAL master country before any overwrites (so change-note is accurate)
-    original_country_series = df_master[master_country_col].astype(str).copy() if master_country_col else None
 
     # Build picklist "source of truth" country labels
     picklist_country_label_by_canon = {}
@@ -396,12 +409,22 @@ def run_matching(master_bytes: bytes, picklist_bytes: bytes, apply_colours: bool
             if v:
                 picklist_country_label_by_canon[canon_country_key(v)] = v
 
+    # These are the columns we will standardise:
+    # - match master → picklist using normalised key
+    # - overwrite master value ONLY when there is an exact normalised match
     EXACT_PAIRS = [
         ("country", colmap.get("master_country"), colmap.get("pick_country")),
         ("industry", colmap.get("master_industry"), colmap.get("pick_industry")),
         ("departments", colmap.get("master_departments"), colmap.get("pick_departments")),
         ("asset_title", colmap.get("master_asset_title"), colmap.get("pick_asset_title")),
+        ("seniority", colmap.get("master_seniority"), colmap.get("pick_seniority")),
     ]
+
+    # Store ORIGINAL values before overwrites (for change notes)
+    original_series_by_friendly = {}
+    for friendly, master_col, pick_col in EXACT_PAIRS:
+        if master_col and master_col in df_master.columns:
+            original_series_by_friendly[friendly] = df_master[master_col].astype(str).copy()
 
     if progress_cb:
         progress_cb(0.15, "Running picklist checks...")
@@ -414,6 +437,7 @@ def run_matching(master_bytes: bytes, picklist_bytes: bytes, apply_colours: bool
         if not master_col or not pick_col:
             continue
 
+        # Picklist map: normalised key -> exact picklist text (bible formatting)
         pick_map = {
             norm_picklist_value(v): str(v).strip()
             for v in df_picklist[pick_col]
@@ -426,6 +450,7 @@ def run_matching(master_bytes: bytes, picklist_bytes: bytes, apply_colours: bool
         for raw_val in df_master[master_col]:
             v = str(raw_val)
 
+            # Special handling: country canon -> force to picklist format where possible
             if friendly == "country":
                 canon = canon_country_key(v)
                 if canon in picklist_country_label_by_canon:
@@ -433,35 +458,42 @@ def run_matching(master_bytes: bytes, picklist_bytes: bytes, apply_colours: bool
 
             key = norm_picklist_value(v)
 
+            # ONLY overwrite when we are sure: exact match on normalised key
             if key in pick_map:
                 matches.append("Yes")
-                new_vals.append(pick_map[key])
+                new_vals.append(pick_map[key])  # overwrite to picklist formatting
             else:
                 matches.append("No")
-                new_vals.append(v)
+                new_vals.append(v)  # keep original
 
         df_out[out_col] = matches
         df_out[master_col] = new_vals
 
-    # Country change audit: ORIGINAL -> FINAL (after overwrite)
+    # Change notes for every standardised field (Country/Seniority/etc.)
     if progress_cb:
-        progress_cb(0.30, "Auditing country changes...")
+        progress_cb(0.30, "Auditing changes...")
 
-    if master_country_col and original_country_series is not None:
+    for friendly, master_col, pick_col in EXACT_PAIRS:
+        if not master_col or friendly not in original_series_by_friendly:
+            continue
+
+        orig_vals = original_series_by_friendly[friendly]
+        final_vals = df_out[master_col].astype(str)
+
         notes = []
-        final_vals = df_out[master_country_col].astype(str)
-
-        for orig, final in zip(original_country_series, final_vals):
-            o = str(orig).strip()
-            f = str(final).strip()
-            if o and f and norm_text(o) != norm_text(f):
-                notes.append(f"{o} → {f}")
+        for o, f in zip(orig_vals, final_vals):
+            o2 = str(o).strip()
+            f2 = str(f).strip()
+            if o2 and f2 and norm_text(o2) != norm_text(f2):
+                notes.append(f"{o2} → {f2}")
             else:
                 notes.append("")
-        df_out["Country_Change_Note"] = notes
-        added_cols += ["Country_Change_Note"]
 
-    # Seniority parse
+        note_col = f"{friendly.title()}_Change_Note"
+        df_out[note_col] = notes
+        added_cols.append(note_col)
+
+    # Derived seniority from Job Title (separate from picklist seniority)
     if progress_cb:
         progress_cb(0.45, "Parsing seniority...")
 
@@ -509,9 +541,9 @@ def run_matching(master_bytes: bytes, picklist_bytes: bytes, apply_colours: bool
         progress_cb(0.75, "Checking phone vs country...")
 
     phone_col = colmap.get("master_phone")
-    country_for_phone = master_country_col
+    master_country_col = colmap.get("master_country")
 
-    if phone_col and country_for_phone:
+    if phone_col and master_country_col:
         st_col = f"{phone_col}_PhoneCountry_Status"
         rs_col = f"{phone_col}_PhoneCountry_Reason"
         added_cols += [st_col, rs_col]
@@ -519,7 +551,7 @@ def run_matching(master_bytes: bytes, picklist_bytes: bytes, apply_colours: bool
         out_status, out_reason = [], []
         for i in range(len(df_master)):
             raw_phone = df_master.at[i, phone_col]
-            ctry = df_out.at[i, country_for_phone] if country_for_phone in df_out.columns else ""
+            ctry = df_out.at[i, master_country_col] if master_country_col in df_out.columns else ""
             s, r = phone_country_check(raw_phone, ctry)
             out_status.append(s)
             out_reason.append(r)
@@ -531,7 +563,7 @@ def run_matching(master_bytes: bytes, picklist_bytes: bytes, apply_colours: bool
         df_out["PhoneCountry_Reason"] = ""
         added_cols += ["PhoneCountry_Status", "PhoneCountry_Reason"]
 
-    # Required fields
+    # Required fields (basic)
     if progress_cb:
         progress_cb(0.85, "Checking required fields...")
 
@@ -609,31 +641,38 @@ def run_matching(master_bytes: bytes, picklist_bytes: bytes, apply_colours: bool
     if not apply_colours:
         return output.read()
 
-    # Apply formatting
+    # ------------------ Apply formatting ------------------
     wb = load_workbook(output)
     ws = wb["Results"]
 
     headers = [cell.value for cell in ws[1]]
-    col_index = {str(v): i + 1 for i, v in enumerate(headers)}
+    col_index_raw = {("" if v is None else str(v)): i + 1 for i, v in enumerate(headers)}
+    col_index_clean = {_clean_header(v): i + 1 for i, v in enumerate(headers)}
     max_row = ws.max_row
+
+    def get_col_idx(name: str):
+        if name is None:
+            return None
+        name_raw = str(name)
+        if name_raw in col_index_raw:
+            return col_index_raw[name_raw]
+        return col_index_clean.get(_clean_header(name_raw))
 
     # Yellow headers for added columns
     for col_name in set(added_cols):
-        if col_name in col_index:
-            ws.cell(row=1, column=col_index[col_name]).fill = HEADER_YELLOW
+        cidx = get_col_idx(col_name)
+        if cidx:
+            ws.cell(row=1, column=cidx).fill = HEADER_YELLOW
 
     def fill_column(col_name: str, is_green_fn):
-        if col_name not in col_index:
+        cidx = get_col_idx(col_name)
+        if not cidx:
             return
-        cidx = col_index[col_name]
         for r in range(2, max_row + 1):
             val = ws.cell(row=r, column=cidx).value
             if val is None:
                 continue
-            if is_green_fn(str(val)):
-                ws.cell(row=r, column=cidx).fill = CELL_GREEN
-            else:
-                ws.cell(row=r, column=cidx).fill = CELL_BLUE
+            ws.cell(row=r, column=cidx).fill = CELL_GREEN if is_green_fn(str(val)) else CELL_BLUE
 
     # Match_* columns
     for mc in match_cols:
@@ -646,25 +685,39 @@ def run_matching(master_bytes: bytes, picklist_bytes: bytes, apply_colours: bool
     for pc in phone_status_cols:
         fill_column(pc, lambda v: norm_text(v) == "match")
 
-    # Phone reason columns (Valid for country vs not)
+    # Phone reason columns
     phone_reason_cols = [c for c in df_out.columns if c.endswith("_PhoneCountry_Reason")]
     if "PhoneCountry_Reason" in df_out.columns:
         phone_reason_cols.append("PhoneCountry_Reason")
     for rc in phone_reason_cols:
         fill_column(rc, lambda v: norm_text(v) == "valid for country")
 
-    # Highlight COUNTRY cells where a change was made (based on Country_Change_Note)
-    if master_country_col and "Country_Change_Note" in col_index and master_country_col in col_index:
-        note_idx = col_index["Country_Change_Note"]
-        country_idx = col_index[master_country_col]
+    # Highlight cells that were changed based on *_Change_Note columns
+    change_note_cols = [c for c in df_out.columns if c.endswith("_Change_Note")]
+    for note_col in change_note_cols:
+        note_idx = get_col_idx(note_col)
+        if not note_idx:
+            continue
+
+        friendly = note_col.replace("_Change_Note", "").lower()
+        base_master_col = None
+        for fr, master_col, pick_col in EXACT_PAIRS:
+            if fr == friendly:
+                base_master_col = master_col
+                break
+
+        base_idx = get_col_idx(base_master_col) if base_master_col else None
+        if not base_idx:
+            continue
+
         for r in range(2, max_row + 1):
             note_val = ws.cell(row=r, column=note_idx).value
             if note_val is not None and str(note_val).strip() != "":
-                ws.cell(row=r, column=country_idx).fill = CELL_CHANGE
+                ws.cell(row=r, column=base_idx).fill = CELL_CHANGE
 
     # Missing required fields
-    if "Missing_Required_Fields" in col_index:
-        cidx = col_index["Missing_Required_Fields"]
+    if get_col_idx("Missing_Required_Fields"):
+        cidx = get_col_idx("Missing_Required_Fields")
         for r in range(2, max_row + 1):
             val = ws.cell(row=r, column=cidx).value
             if val is None or str(val).strip() == "":
@@ -675,8 +728,8 @@ def run_matching(master_bytes: bytes, picklist_bytes: bytes, apply_colours: bool
     # Overall status + issues
     fill_column("Overall_Status", lambda v: norm_text(v) == "pass")
 
-    if "Overall_Issues" in col_index:
-        cidx = col_index["Overall_Issues"]
+    if get_col_idx("Overall_Issues"):
+        cidx = get_col_idx("Overall_Issues")
         for r in range(2, max_row + 1):
             val = ws.cell(row=r, column=cidx).value
             if val is None or str(val).strip() == "":
@@ -697,7 +750,8 @@ st.caption(
     "🟩 Green = OK / match, 🟦 Blue = review.\n"
     "📞 Phone validation runs in the background and does NOT change your phone field.\n"
     "🌍 Country names are standardised to the picklist format where possible (e.g. GB/England → United Kingdom).\n"
-    "🧩 Picklist matching treats '&' and 'and' as equivalent (e.g. Travel & Tourism)."
+    "🧩 Picklist matching treats '&' and 'and' as equivalent (e.g. Travel & Tourism).\n"
+    "📌 Any master value overwritten to match picklist formatting is highlighted."
 )
 
 col1, col2 = st.columns(2)
