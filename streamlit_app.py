@@ -50,14 +50,6 @@ def norm_picklist_value(s) -> str:
     return x
 
 
-def looks_like_datetime_string(s: str) -> bool:
-    """Detects dd/mm/yyyy or dd/mm/yyyy hh:mm:ss strings (so we can keep them as TEXT in Excel)."""
-    if not isinstance(s, str):
-        return False
-    s = s.strip()
-    return bool(re.fullmatch(r"\d{2}/\d{2}/\d{4}( \d{2}:\d{2}:\d{2})?", s))
-
-
 # ------------------ Flexible header detection ------------------
 def _clean_header(h) -> str:
     h = "" if h is None else str(h)
@@ -239,7 +231,6 @@ def _company_tokens(company: str) -> list[str]:
     s = re.sub(r"[^A-Za-z0-9\s]", " ", s)
     toks = [t.lower() for t in s.split() if t.strip()]
 
-    # remove suffixes, but keep "group"
     toks = [t for t in toks if (t not in SUFFIXES) or (t == "group")]
     toks = [t for t in toks if t not in STOPWORDS]
     toks = [t for t in toks if t not in COUNTRY_WORDS_FOR_ACRONYM]
@@ -311,7 +302,6 @@ def parse_seniority(title):
         return "Director"
     if re.search(r"\bmanager\b", t):
         return "Manager"
-
     return "Entry"
 
 
@@ -377,7 +367,7 @@ def phone_country_check(raw_phone, country_label) -> tuple[str, str]:
             nanp_set = {"US", "CA"}
             if actual_region and actual_region not in expected_set:
                 if expected_set.issubset(nanp_set) and actual_region in nanp_set:
-                    pass  # allow US <-> CA
+                    pass
                 else:
                     return "Warning", f"Parsed region {actual_region} != expected {regions}"
 
@@ -393,8 +383,28 @@ def phone_country_check(raw_phone, country_label) -> tuple[str, str]:
     return "Unsure", "Could not parse phone for supplied country"
 
 
+# ------------------ Excel helpers (preserve master exactly) ------------------
+def _first_visible_sheet(wb):
+    for name in wb.sheetnames:
+        ws = wb[name]
+        if ws.sheet_state == "visible":
+            return ws
+    return wb[wb.sheetnames[0]]
+
+
+def _build_header_to_col(ws):
+    headers = {}
+    for c in range(1, ws.max_column + 1):
+        v = ws.cell(row=1, column=c).value
+        if v is None:
+            continue
+        headers[str(v)] = c
+    return headers
+
+
 # ------------------ Main processing ------------------
 def run_matching(master_bytes: bytes, picklist_bytes: bytes, apply_colours: bool, progress_cb=None) -> bytes:
+    # Read with pandas for logic only (NOT for writing dates back)
     df_master = pd.read_excel(io.BytesIO(master_bytes), dtype=str, keep_default_na=False)
     df_picklist = pd.read_excel(io.BytesIO(picklist_bytes), dtype=str, keep_default_na=False)
 
@@ -403,7 +413,7 @@ def run_matching(master_bytes: bytes, picklist_bytes: bytes, apply_colours: bool
 
     colmap = detect_columns(df_master, df_picklist)
 
-    # Build picklist "source of truth" country labels
+    # Picklist "bible" country labels
     picklist_country_label_by_canon = {}
     pick_country_col = colmap.get("pick_country")
     if pick_country_col:
@@ -420,7 +430,7 @@ def run_matching(master_bytes: bytes, picklist_bytes: bytes, apply_colours: bool
         ("seniority", colmap.get("master_seniority"), colmap.get("pick_seniority")),
     ]
 
-    # Store ORIGINAL values before overwrites (for change notes)
+    # originals (for change notes)
     original_series_by_friendly = {}
     for friendly, master_col, pick_col in EXACT_PAIRS:
         if master_col and master_col in df_master.columns:
@@ -437,7 +447,7 @@ def run_matching(master_bytes: bytes, picklist_bytes: bytes, apply_colours: bool
         if not master_col or not pick_col:
             continue
 
-        # Safety: never standardise date/time columns if column detection went wrong
+        # Safety: never standardise date/time columns if detection went wrong
         if "date" in _clean_header(master_col) or "time" in _clean_header(master_col):
             df_out[out_col] = "Skipped (date/time column)"
             continue
@@ -471,7 +481,6 @@ def run_matching(master_bytes: bytes, picklist_bytes: bytes, apply_colours: bool
         df_out[out_col] = matches
         df_out[master_col] = new_vals
 
-    # Change notes for every standardised field
     if progress_cb:
         progress_cb(0.30, "Auditing changes...")
 
@@ -495,7 +504,6 @@ def run_matching(master_bytes: bytes, picklist_bytes: bytes, apply_colours: bool
         df_out[note_col] = notes
         added_cols.append(note_col)
 
-    # Derived seniority from Job Title (separate from picklist seniority)
     if progress_cb:
         progress_cb(0.45, "Parsing seniority...")
 
@@ -503,7 +511,6 @@ def run_matching(master_bytes: bytes, picklist_bytes: bytes, apply_colours: bool
     df_out["Parsed_Seniority"] = df_out[jobtitle_col].apply(parse_seniority) if jobtitle_col else ""
     added_cols.append("Parsed_Seniority")
 
-    # Company/domain check
     if progress_cb:
         progress_cb(0.60, "Checking company vs domain...")
 
@@ -538,7 +545,6 @@ def run_matching(master_bytes: bytes, picklist_bytes: bytes, apply_colours: bool
     df_out["Company_Domain_Reason"] = reasons
     added_cols += ["Company_Domain_Status", "Company_Domain_Score", "Company_Domain_Reason"]
 
-    # Phone vs country check
     if progress_cb:
         progress_cb(0.75, "Checking phone vs country...")
 
@@ -565,7 +571,6 @@ def run_matching(master_bytes: bytes, picklist_bytes: bytes, apply_colours: bool
         df_out["PhoneCountry_Reason"] = ""
         added_cols += ["PhoneCountry_Status", "PhoneCountry_Reason"]
 
-    # Required fields (basic)
     if progress_cb:
         progress_cb(0.85, "Checking required fields...")
 
@@ -589,7 +594,6 @@ def run_matching(master_bytes: bytes, picklist_bytes: bytes, apply_colours: bool
         df_out["Missing_Required_Fields"] = missing_list
         added_cols.append("Missing_Required_Fields")
 
-    # Overall status + issues summary
     if progress_cb:
         progress_cb(0.92, "Building overall status...")
 
@@ -631,131 +635,123 @@ def run_matching(master_bytes: bytes, picklist_bytes: bytes, apply_colours: bool
     df_out["Overall_Issues"] = overall_issues
     added_cols += ["Overall_Status", "Overall_Issues"]
 
-    # Write Excel
+    # ------------------ WRITE OUTPUT (preserve master exactly) ------------------
     if progress_cb:
-        progress_cb(0.96, "Writing Excel output...")
+        progress_cb(0.96, "Writing Excel output (preserving master formats)...")
 
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df_out.to_excel(writer, index=False, sheet_name="Results")
-    output.seek(0)
+    wb = load_workbook(io.BytesIO(master_bytes))
+    ws = _first_visible_sheet(wb)
+    ws.title = "Results"
 
-    if not apply_colours:
-        return output.read()
-
-    # ------------------ Apply formatting ------------------
-    wb = load_workbook(output)
-    ws = wb["Results"]
-
-    # ---- Preserve dd/mm/yyyy and dd/mm/yyyy hh:mm:ss exactly as text (stop Excel reformatting) ----
-    for col_idx in range(1, ws.max_column + 1):
-        sample_vals = [
-            ws.cell(row=r, column=col_idx).value
-            for r in range(2, min(ws.max_row, 20) + 1)
-        ]
-        if any(isinstance(v, str) and looks_like_datetime_string(v) for v in sample_vals):
-            for r in range(2, ws.max_row + 1):
-                v = ws.cell(row=r, column=col_idx).value
-                if isinstance(v, str) and looks_like_datetime_string(v):
-                    ws.cell(row=r, column=col_idx).number_format = "@"
-                    ws.cell(row=r, column=col_idx).value = v
-
-    headers = [cell.value for cell in ws[1]]
-    col_index_raw = {("" if v is None else str(v)): i + 1 for i, v in enumerate(headers)}
-    col_index_clean = {_clean_header(v): i + 1 for i, v in enumerate(headers)}
+    header_to_col = _build_header_to_col(ws)
     max_row = ws.max_row
+    last_col = ws.max_column
 
-    def get_col_idx(name: str):
-        if name is None:
-            return None
-        name_raw = str(name)
-        if name_raw in col_index_raw:
-            return col_index_raw[name_raw]
-        return col_index_clean.get(_clean_header(name_raw))
+    # Add new columns at the end (do NOT touch existing columns like dates)
+    new_col_start = last_col + 1
 
-    # Yellow headers for added columns
-    for col_name in set(added_cols):
-        cidx = get_col_idx(col_name)
-        if cidx:
-            ws.cell(row=1, column=cidx).fill = HEADER_YELLOW
+    # Ensure added_cols are unique but keep order
+    seen = set()
+    ordered_added = []
+    for c in added_cols:
+        if c not in seen:
+            seen.add(c)
+            ordered_added.append(c)
 
-    def fill_column(col_name: str, is_green_fn):
-        cidx = get_col_idx(col_name)
-        if not cidx:
-            return
-        for r in range(2, max_row + 1):
-            val = ws.cell(row=r, column=cidx).value
-            if val is None:
-                continue
-            ws.cell(row=r, column=cidx).fill = CELL_GREEN if is_green_fn(str(val)) else CELL_BLUE
+    # Write new headers
+    for j, col_name in enumerate(ordered_added):
+        cidx = new_col_start + j
+        ws.cell(row=1, column=cidx).value = col_name
+        ws.cell(row=1, column=cidx).fill = HEADER_YELLOW
 
-    # Match_* columns
-    for mc in match_cols:
-        fill_column(mc, lambda v: norm_text(v) == "yes")
-
-    # Company domain status
-    fill_column("Company_Domain_Status", lambda v: norm_text(v) in {"likely match", "match"})
-
-    # Phone status columns
-    for pc in phone_status_cols:
-        fill_column(pc, lambda v: norm_text(v) == "match")
-
-    # Phone reason columns
-    phone_reason_cols = [c for c in df_out.columns if c.endswith("_PhoneCountry_Reason")]
-    if "PhoneCountry_Reason" in df_out.columns:
-        phone_reason_cols.append("PhoneCountry_Reason")
-    for rc in phone_reason_cols:
-        fill_column(rc, lambda v: norm_text(v) == "valid for country")
-
-    # Highlight cells that were changed based on *_Change_Note columns
-    change_note_cols = [c for c in df_out.columns if c.endswith("_Change_Note")]
-    for note_col in change_note_cols:
-        note_idx = get_col_idx(note_col)
-        if not note_idx:
+    # Overwrite ONLY picklist-standardised master columns (country/industry/etc.) when sure
+    # and highlight changed cells
+    for friendly, master_col, pick_col in EXACT_PAIRS:
+        if not master_col or master_col not in header_to_col:
+            continue
+        # extra safety: never overwrite date/time columns
+        if "date" in _clean_header(master_col) or "time" in _clean_header(master_col):
             continue
 
-        friendly = note_col.replace("_Change_Note", "").lower()
-        base_master_col = None
-        for fr, master_col, pick_col in EXACT_PAIRS:
-            if fr == friendly:
-                base_master_col = master_col
+        cidx = header_to_col[master_col]
+        note_col = f"{friendly.title()}_Change_Note"
+        note_series = df_out[note_col] if note_col in df_out.columns else None
+
+        for r in range(2, max_row + 1):
+            i = r - 2  # dataframe index
+            if i >= len(df_out):
                 break
+            new_val = df_out.at[i, master_col]
+            ws.cell(row=r, column=cidx).value = new_val
 
-        base_idx = get_col_idx(base_master_col) if base_master_col else None
-        if not base_idx:
-            continue
+            if note_series is not None:
+                note_val = str(note_series.iat[i]).strip()
+                if note_val:
+                    ws.cell(row=r, column=cidx).fill = CELL_CHANGE
 
-        for r in range(2, max_row + 1):
-            note_val = ws.cell(row=r, column=note_idx).value
-            if note_val is not None and str(note_val).strip() != "":
-                ws.cell(row=r, column=base_idx).fill = CELL_CHANGE
+    # Write appended new columns values + colour them
+    name_to_newcol = {nm: new_col_start + j for j, nm in enumerate(ordered_added)}
 
-    # Missing required fields
-    if get_col_idx("Missing_Required_Fields"):
-        cidx = get_col_idx("Missing_Required_Fields")
-        for r in range(2, max_row + 1):
-            val = ws.cell(row=r, column=cidx).value
-            if val is None or str(val).strip() == "":
-                ws.cell(row=r, column=cidx).fill = CELL_GREEN
-            else:
-                ws.cell(row=r, column=cidx).fill = CELL_BLUE
+    def set_fill(r, c, ok: bool):
+        ws.cell(row=r, column=c).fill = CELL_GREEN if ok else CELL_BLUE
 
-    # Overall status + issues
-    fill_column("Overall_Status", lambda v: norm_text(v) == "pass")
+    for r in range(2, max_row + 1):
+        i = r - 2
+        if i >= len(df_out):
+            break
 
-    if get_col_idx("Overall_Issues"):
-        cidx = get_col_idx("Overall_Issues")
-        for r in range(2, max_row + 1):
-            val = ws.cell(row=r, column=cidx).value
-            if val is None or str(val).strip() == "":
-                ws.cell(row=r, column=cidx).fill = CELL_GREEN
-            else:
-                ws.cell(row=r, column=cidx).fill = CELL_BLUE
+        for col_name in ordered_added:
+            cidx = name_to_newcol[col_name]
+            val = df_out.at[i, col_name] if col_name in df_out.columns else ""
+            ws.cell(row=r, column=cidx).value = val
 
-    out2 = io.BytesIO()
-    wb.save(out2)
-    out2.seek(0)
-    return out2.read()
+    # Apply colouring rules to the NEW columns only
+    for r in range(2, max_row + 1):
+        i = r - 2
+        if i >= len(df_out):
+            break
+
+        # Match_* columns
+        for mc in match_cols:
+            if mc in name_to_newcol:
+                cidx = name_to_newcol[mc]
+                set_fill(r, cidx, norm_text(df_out.at[i, mc]) == "yes")
+
+        # Company domain status
+        if "Company_Domain_Status" in name_to_newcol:
+            cidx = name_to_newcol["Company_Domain_Status"]
+            set_fill(r, cidx, norm_text(df_out.at[i, "Company_Domain_Status"]) in {"likely match", "match"})
+
+        # Phone status columns
+        for pc in phone_status_cols:
+            if pc in name_to_newcol:
+                cidx = name_to_newcol[pc]
+                set_fill(r, cidx, norm_text(df_out.at[i, pc]) == "match")
+
+        # Phone reason columns
+        for rc in [c for c in df_out.columns if c.endswith("_PhoneCountry_Reason")] + (["PhoneCountry_Reason"] if "PhoneCountry_Reason" in df_out.columns else []):
+            if rc in name_to_newcol:
+                cidx = name_to_newcol[rc]
+                set_fill(r, cidx, norm_text(df_out.at[i, rc]) == "valid for country")
+
+        # Missing required fields
+        if "Missing_Required_Fields" in name_to_newcol:
+            cidx = name_to_newcol["Missing_Required_Fields"]
+            set_fill(r, cidx, str(df_out.at[i, "Missing_Required_Fields"]).strip() == "")
+
+        # Overall
+        if "Overall_Status" in name_to_newcol:
+            cidx = name_to_newcol["Overall_Status"]
+            set_fill(r, cidx, norm_text(df_out.at[i, "Overall_Status"]) == "pass")
+
+        if "Overall_Issues" in name_to_newcol:
+            cidx = name_to_newcol["Overall_Issues"]
+            set_fill(r, cidx, str(df_out.at[i, "Overall_Issues"]).strip() == "")
+
+    out = io.BytesIO()
+    wb.save(out)
+    out.seek(0)
+    return out.read()
 
 
 # ------------------ Streamlit UI ------------------
@@ -764,10 +760,10 @@ st.caption(
     "Upload the **Lead Master** and the **Picklist**, then click **Run matching**.\n\n"
     "🟩 Green = OK / match, 🟦 Blue = review.\n"
     "📞 Phone validation runs in the background and does NOT change your phone field.\n"
-    "🌍 Country names are standardised to the picklist format where possible (e.g. GB/England → United Kingdom).\n"
-    "🧩 Picklist matching treats '&' and 'and' as equivalent (e.g. Travel & Tourism).\n"
+    "🌍 Country names are standardised to the picklist format where possible.\n"
+    "🧩 Picklist matching treats '&' and 'and' as equivalent.\n"
     "📌 Any master value overwritten to match picklist formatting is highlighted.\n"
-    "🗓 Date/time values in dd/mm/yyyy (and dd/mm/yyyy hh:mm:ss) are preserved exactly as entered."
+    "🗓 Dates/times remain EXACTLY as per the master (no rewriting of original cells)."
 )
 
 col1, col2 = st.columns(2)
