@@ -412,27 +412,28 @@ def run_matching(master_bytes: bytes, picklist_bytes: bytes, apply_colours: bool
         if not master_col or not pick_col:
             continue
 
-        pick_map = {norm_text(v): str(v).strip() for v in df_picklist[pick_col] if str(v).strip() != ""}
+pick_map = {
+    norm_picklist_value(v): str(v).strip()
+    for v in df_picklist[pick_col]
+    if str(v).strip() != ""
+}
 
-        matches = []
-        new_vals = []
+matches = []
+new_vals = []
 
-        for raw_val in df_master[master_col]:
-            v = str(raw_val)
+for raw_val in df_master[master_col]:
+    v = str(raw_val)
 
-            # If this is country, standardise (England -> United Kingdom etc.)
-            if friendly == "country":
-                canon = canon_country_key(v)
-                if canon in picklist_country_label_by_canon:
-                    v = picklist_country_label_by_canon[canon]
+    # country already standardised earlier
+    key = norm_picklist_value(v)
 
-            key = norm_text(v)
-            if key in pick_map:
-                matches.append("Yes")
-                new_vals.append(pick_map[key])  # exact picklist label
-            else:
-                matches.append("No")
-                new_vals.append(v)
+    if key in pick_map:
+        matches.append("Yes")
+        new_vals.append(pick_map[key])  # exact picklist label
+    else:
+        matches.append("No")
+        new_vals.append(v)
+
 
         df_out[out_col] = matches
         df_out[master_col] = new_vals  # write back standardised text into the detected column
